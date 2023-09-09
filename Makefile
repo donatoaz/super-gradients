@@ -70,8 +70,10 @@ coco2017_yolo_nas_pose_s_ema_less_mosaic_lr_focal:
 	python src/super_gradients/train_from_recipe.py --config-name=coco2017_yolo_nas_pose_s_ema_less_mosaic_lr_focal
 
 coco2017_yolo_nas_pose_shared_s_ema_less_mosaic_lr_focal_local:
-	python src/super_gradients/train_from_recipe.py --config-name=coco2017_yolo_nas_pose_shared_s_ema_less_mosaic_lr_focal
+	python src/super_gradients/train_from_recipe.py --config-name=coco2017_yolo_nas_pose_shared_s_ema_less_mosaic_lr_focal dataset_params.train_dataset_params.data_dir=/home/bloodaxe/data/coco2017 dataset_params.val_dataset_params.data_dir=/home/bloodaxe/data/coco2017 num_gpus=4
 
+coco2017_yolo_nas_pose_s_ema_wider_head:
+	python src/super_gradients/train_from_recipe.py --config-name=coco2017_yolo_nas_pose_s_ema_wider_head
 
 crowdpose_yolo_nas_pose_s:
 	python src/super_gradients/train_from_recipe.py --config-name=crowdpose_yolo_nas_pose_s
