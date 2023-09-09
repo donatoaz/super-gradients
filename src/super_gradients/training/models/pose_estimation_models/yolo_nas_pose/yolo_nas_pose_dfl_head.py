@@ -1,5 +1,5 @@
 import math
-from typing import Tuple, Callable
+from typing import Tuple, Callable, Optional
 
 import torch
 from torch import nn, Tensor
@@ -27,6 +27,7 @@ class YoloNASPoseDFLHead(BaseDetectionModule, SupportsReplaceNumClasses):
         num_classes: int,
         stride: int,
         reg_max: int,
+        pose_inter_channels: Optional[int] = None,
         cls_dropout_rate: float = 0.0,
         reg_dropout_rate: float = 0.0,
     ):
@@ -44,7 +45,12 @@ class YoloNASPoseDFLHead(BaseDetectionModule, SupportsReplaceNumClasses):
         """
         super().__init__(in_channels)
 
+        if pose_inter_channels is None:
+            pose_inter_channels = inter_channels
+
         inter_channels = width_multiplier(inter_channels, width_mult, 8)
+        pose_inter_channels = width_multiplier(pose_inter_channels, width_mult, 8)
+
         if first_conv_group_size == 0:
             groups = 0
         elif first_conv_group_size == -1:
@@ -54,6 +60,7 @@ class YoloNASPoseDFLHead(BaseDetectionModule, SupportsReplaceNumClasses):
 
         self.num_classes = num_classes
         self.stem = ConvBNReLU(in_channels, inter_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.stem_pose = ConvBNReLU(in_channels, pose_inter_channels, kernel_size=1, stride=1, padding=0, bias=False)
 
         first_cls_conv = [ConvBNReLU(inter_channels, inter_channels, kernel_size=3, stride=1, padding=1, groups=groups, bias=False)] if groups else []
         self.cls_convs = nn.Sequential(*first_cls_conv, ConvBNReLU(inter_channels, inter_channels, kernel_size=3, stride=1, padding=1, bias=False))
@@ -61,25 +68,26 @@ class YoloNASPoseDFLHead(BaseDetectionModule, SupportsReplaceNumClasses):
         first_reg_conv = [ConvBNReLU(inter_channels, inter_channels, kernel_size=3, stride=1, padding=1, groups=groups, bias=False)] if groups else []
         self.reg_convs = nn.Sequential(*first_reg_conv, ConvBNReLU(inter_channels, inter_channels, kernel_size=3, stride=1, padding=1, bias=False))
 
-        first_pose_conv = [ConvBNReLU(inter_channels, inter_channels, kernel_size=3, stride=1, padding=1, groups=groups, bias=False)] if groups else []
-        self.pose_convs = nn.Sequential(*first_pose_conv, ConvBNReLU(inter_channels, inter_channels, kernel_size=3, stride=1, padding=1, bias=False))
+        first_pose_conv = (
+            [ConvBNReLU(pose_inter_channels, pose_inter_channels, kernel_size=3, stride=1, padding=1, groups=groups, bias=False)] if groups else []
+        )
+        self.pose_convs = nn.Sequential(*first_pose_conv, ConvBNReLU(pose_inter_channels, pose_inter_channels, kernel_size=3, stride=1, padding=1, bias=False))
 
-        self.cls_pred = nn.Conv2d(inter_channels, 1 + self.num_classes, 1, 1, 0)
+        self.cls_pred = nn.Conv2d(inter_channels, 1, 1, 1, 0)
         self.reg_pred = nn.Conv2d(inter_channels, 4 * (reg_max + 1), 1, 1, 0)
-        self.pose_pred = nn.Conv2d(inter_channels, 2 * self.num_classes, 1, 1, 0)  # each keypoint is x,y,confidence
+        self.pose_pred = nn.Conv2d(pose_inter_channels, 3 * self.num_classes, 1, 1, 0)  # each keypoint is x,y,confidence
 
         self.cls_dropout_rate = nn.Dropout2d(cls_dropout_rate) if cls_dropout_rate > 0 else nn.Identity()
         self.reg_dropout_rate = nn.Dropout2d(reg_dropout_rate) if reg_dropout_rate > 0 else nn.Identity()
 
-        self.grid = torch.zeros(1)
         self.stride = stride
 
         self.prior_prob = 1e-2
         self._initialize_biases()
 
     def replace_num_classes(self, num_classes: int, compute_new_weights_fn: Callable[[nn.Module, int], nn.Module]):
-        self.cls_pred = compute_new_weights_fn(self.pose_pred, 1 + num_classes)
-        self.pose_pred = compute_new_weights_fn(self.pose_pred, 2 * num_classes)
+        self.cls_pred = compute_new_weights_fn(self.pose_pred, 1)
+        self.pose_pred = compute_new_weights_fn(self.pose_pred, 3 * num_classes)
         self.num_classes = num_classes
 
     @property
@@ -95,25 +103,19 @@ class YoloNASPoseDFLHead(BaseDetectionModule, SupportsReplaceNumClasses):
             - cls_output: Tensor of [B, 1, H, W]
             - pose_output: Tensor of [B, num_classes, 3, H, W]
         """
-        x = self.stem(x)
+        box_feat = self.stem(x)
+        pose_feat = self.stem_pose(x)
 
-        cls_feat = self.cls_convs(x)
-        cls_feat = self.cls_dropout_rate(cls_feat)
-        cls_output = self.cls_pred(cls_feat)
+        cls_feat = self.cls_convs(box_feat)
+        cls_output = self.cls_pred(self.cls_dropout_rate(cls_feat))
 
-        pose_logits = cls_output[:, 1:, None, :, :]
-        cls_output = cls_output[:, 0:1, :, :]
+        reg_feat = self.reg_convs(box_feat)
+        reg_output = self.reg_pred(self.reg_dropout_rate(reg_feat))
 
-        reg_feat = self.reg_convs(x)
-        reg_feat = self.reg_dropout_rate(reg_feat)
-        reg_output = self.reg_pred(reg_feat)
+        pose_feat = self.pose_convs(pose_feat)
+        pose_output = self.pose_pred(self.reg_dropout_rate(pose_feat))
 
-        pose_feat = self.pose_convs(x)
-        pose_feat = self.reg_dropout_rate(pose_feat)
-
-        pose_output = self.pose_pred(pose_feat)
-        pose_output = pose_output.reshape((pose_output.size(0), self.num_classes, 2, pose_output.size(2), pose_output.size(3)))
-        pose_output = torch.cat((pose_output, pose_logits), dim=2)
+        pose_output = pose_output.reshape((pose_output.size(0), self.num_classes, 3, pose_output.size(2), pose_output.size(3)))
         return reg_output, cls_output, pose_output
 
     def _initialize_biases(self):
